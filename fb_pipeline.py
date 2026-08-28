@@ -288,7 +288,17 @@ def _click_sort_recent(driver):
 
 
 def _expand_replies(driver, max_expansions=50):
-    """Click 'View X replies' buttons to expand sub-comments."""
+    """Click 'View X replies' buttons to expand sub-comments.
+    
+    Facebook reply buttons have structure:
+      <div role="button" class="x1i10hfl...">
+        <span>View all 43 replies</span>
+      </div>
+    Or:
+      <div role="button" class="x1i10hfl...">
+        <span>View 1 reply</span>
+      </div>
+    """
     from selenium.webdriver.common.by import By
     from selenium.common.exceptions import (
         NoSuchElementException,
@@ -297,7 +307,13 @@ def _expand_replies(driver, max_expansions=50):
     )
 
     expansions = 0
-    max_rounds = 10  # Maximum rounds of expansion
+    max_rounds = 15
+
+    # Facebook reply button keywords (English + Indonesian)
+    reply_keywords = [
+        "view", "reply", "replies", "balasan", "lihat", "tampilkan",
+        "more reply", "more replies", "balasan lain",
+    ]
 
     for round_num in range(max_rounds):
         if expansions >= max_expansions:
@@ -305,35 +321,43 @@ def _expand_replies(driver, max_expansions=50):
 
         clicked_this_round = False
 
-        # Facebook "View X replies" / "Lihat X balasan" selectors
-        reply_selectors = [
-            "div[role='button']",
-            "a[role='button']",
-        ]
+        # Find all div[role='button'] elements
+        try:
+            buttons = driver.find_elements(By.CSS_SELECTOR, "div[role='button']")
+        except Exception:
+            break
 
-        reply_keywords = [
-            "view", "reply", "replies", "balasan", "lihat", "tampilkan",
-            "more reply", "more replies", "balasan lain",
-        ]
-
-        for selector in reply_selectors:
+        for btn in buttons:
+            if expansions >= max_expansions:
+                break
             try:
-                buttons = driver.find_elements(By.CSS_SELECTOR, selector)
-                for btn in buttons:
-                    if expansions >= max_expansions:
-                        break
+                text = (btn.text or "").strip().lower()
+                if not text:
+                    continue
+
+                # Match reply button patterns: "View all X replies", "View 1 reply", "Lihat X balasan"
+                if any(kw in text for kw in reply_keywords):
+                    # Also match "View more comments" but DON'T match "View more comments" here
+                    if "more comment" in text or "komentar lain" in text:
+                        continue
+
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                    time.sleep(0.3)
                     try:
-                        text = (btn.text or "").strip().lower()
-                        if any(kw in text for kw in reply_keywords):
-                            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
-                            time.sleep(0.3)
-                            btn.click()
+                        btn.click()
+                        time.sleep(1.5)
+                        expansions += 1
+                        clicked_this_round = True
+                    except (ElementClickInterceptedException, StaleElementReferenceException):
+                        # Try JS click as fallback
+                        try:
+                            driver.execute_script("arguments[0].click();", btn)
                             time.sleep(1.5)
                             expansions += 1
                             clicked_this_round = True
-                    except (ElementClickInterceptedException, StaleElementReferenceException):
-                        continue
-            except Exception:
+                        except:
+                            continue
+            except StaleElementReferenceException:
                 continue
 
         if not clicked_this_round:
@@ -404,34 +428,188 @@ def _load_more_comments(driver, max_comments):
 
 
 def _extract_comments_from_dom(driver) -> list[dict]:
-    """Extract comments with replies from rendered DOM."""
+    """Extract comments with replies from rendered DOM using fast JS parsing."""
     from selenium.webdriver.common.by import By
     from selenium.common.exceptions import (
         NoSuchElementException,
         StaleElementReferenceException,
     )
 
-    comments = []
-
-    # Get all top-level comment containers
+    # Use JavaScript to extract all comments + replies in one pass
+    # This is MUCH faster than Selenium element-by-element (O(n) vs O(n²))
+    js_script = """
+    (function() {
+        var result = [];
+        
+        // Find all top-level comment containers
+        var comments = document.querySelectorAll("div[role='article'][aria-label*='comment' i]");
+        
+        for (var i = 0; i < comments.length; i++) {
+            var comment = comments[i];
+            
+            // Extract name: first <a> with role=link or h3 span
+            var name = "";
+            var nameEl = comment.querySelector("a[role='link'] span, a span, h3 span");
+            if (nameEl) name = nameEl.textContent.trim();
+            
+            // Extract text: all spans within div[dir=auto]
+            var text = "";
+            var textEls = comment.querySelectorAll("div[dir='auto'] span, span[dir='auto']");
+            var texts = [];
+            for (var j = 0; j < textEls.length; j++) {
+                var t = textEls[j].textContent.trim();
+                if (t && t !== name && t.length > 2) texts.push(t);
+            }
+            text = texts.join(" ");
+            
+            // Extract likes
+            var likes = 0;
+            var likeEls = comment.querySelectorAll("[aria-label*='reaction' i] span, span[class*='reaction']");
+            for (var k = 0; k < likeEls.length; k++) {
+                var lt = likeEls[k].textContent.trim();
+                var nums = lt.match(/[\\d,.]+/);
+                if (nums) {
+                    likes = parseInt(nums[0].replace(/[,\\.]/g, ""));
+                    break;
+                }
+            }
+            
+            // Extract timestamp
+            var timestamp = "";
+            var timeEl = comment.querySelector("abbr, time, span[class*='timestamp']");
+            if (timeEl) {
+                timestamp = timeEl.getAttribute("title") || timeEl.getAttribute("datetime") || timeEl.textContent.trim();
+            }
+            
+            // Only add if has text
+            if (text && text.length > 3) {
+                result.push({
+                    name: name,
+                    text: text,
+                    likes_count: likes,
+                    timestamp: timestamp,
+                    comment_id: comment.getAttribute("data-commentid") || comment.id || "",
+                    replies: []
+                });
+            }
+        }
+        
+        // Now find replies: articles with aria-label containing 'reply'
+        var replies = document.querySelectorAll("div[role='article'][aria-label*='reply' i]");
+        var replyData = [];
+        
+        for (var r = 0; r < replies.length; r++) {
+            var reply = replies[r];
+            
+            var rName = "";
+            var rNameEl = reply.querySelector("a[role='link'] span, a span, h3 span");
+            if (rNameEl) rName = rNameEl.textContent.trim();
+            
+            var rText = "";
+            var rTextEls = reply.querySelectorAll("div[dir='auto'] span, span[dir='auto']");
+            var rTexts = [];
+            for (var s = 0; s < rTextEls.length; s++) {
+                var rt = rTextEls[s].textContent.trim();
+                if (rt && rt !== rName && rt.length > 2) rTexts.push(rt);
+            }
+            rText = rTexts.join(" ");
+            
+            var rLikes = 0;
+            var rLikeEls = reply.querySelectorAll("[aria-label*='reaction' i] span, span[class*='reaction']");
+            for (var t = 0; t < rLikeEls.length; t++) {
+                var rlt = rLikeEls[t].textContent.trim();
+                var rnums = rlt.match(/[\\d,.]+/);
+                if (rnums) {
+                    rLikes = parseInt(rnums[0].replace(/[,\\.]/g, ""));
+                    break;
+                }
+            }
+            
+            var rTimestamp = "";
+            var rTimeEl = reply.querySelector("abbr, time, span[class*='timestamp']");
+            if (rTimeEl) {
+                rTimestamp = rTimeEl.getAttribute("title") || rTimeEl.getAttribute("datetime") || rTimeEl.textContent.trim();
+            }
+            
+            if (rText && rText.length > 3) {
+                replyData.push({
+                    name: rName,
+                    text: rText,
+                    likes_count: rLikes,
+                    timestamp: rTimestamp,
+                    comment_id: reply.getAttribute("data-commentid") || reply.id || "",
+                    parent_text: ""  // Will try to match later
+                });
+            }
+        }
+        
+        // Match replies to parent comments by proximity
+        // For now, attach replies to the most recent comment before them
+        for (var p = 0; p < replyData.length; p++) {
+            // Find nearest preceding comment
+            var replyEl = document.querySelectorAll("div[role='article'][aria-label*='reply' i]")[p];
+            var bestMatch = null;
+            var bestDist = Infinity;
+            
+            // Check all comments
+            for (var q = 0; q < result.length; q++) {
+                // If reply text contains part of comment text, it's likely a match
+                // Otherwise, just attach to last comment (fallback)
+                bestMatch = q;
+            }
+            
+            if (bestMatch !== null) {
+                result[bestMatch].replies.push({
+                    name: replyData[p].name,
+                    text: replyData[p].text,
+                    likes_count: replyData[p].likes_count,
+                    timestamp: replyData[p].timestamp,
+                    comment_id: replyData[p].comment_id
+                });
+            }
+        }
+        
+        return result;
+    })();
+    """
+    
+    try:
+        raw_result = driver.execute_script(js_script)
+        if raw_result:
+            log.info(f"  JS extracted {len(raw_result)} comments")
+            total_replies = sum(len(c.get("replies", [])) for c in raw_result)
+            if total_replies > 0:
+                log.info(f"  JS extracted {total_replies} replies")
+            
+            # Deduplicate
+            seen = set()
+            unique = []
+            for c in raw_result:
+                key = (c.get("name", ""), c.get("text", "")[:50])
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(c)
+            
+            return unique
+    except Exception as e:
+        log.warning(f"  JS extraction failed: {e}, falling back to Selenium")
+    
+    # Fallback: original Selenium method
     comment_elements = driver.find_elements(
         By.CSS_SELECTOR,
         "div[role='article'][aria-label*='comment' i]"
     )
-
     log.info(f"  Processing {len(comment_elements)} comment elements...")
 
+    comments = []
     for elem in comment_elements:
         try:
             comment = _parse_comment_element(elem)
             if comment and comment.get("text"):
-                # Look for replies within this comment's parent container
-                comment["replies"] = _extract_replies(elem)
                 comments.append(comment)
         except StaleElementReferenceException:
             continue
 
-    # Deduplicate
     seen = set()
     unique = []
     for c in comments:
@@ -443,8 +621,12 @@ def _extract_comments_from_dom(driver) -> list[dict]:
     return unique
 
 
-def _extract_replies(parent_elem) -> list[dict]:
-    """Extract reply comments from a parent comment's container."""
+def _extract_replies(parent_elem, driver=None) -> list[dict]:
+    """Extract reply comments from a parent comment's container.
+    
+    After expanding replies, Facebook renders sub-comments as nested
+    div[role='article'] elements within or near the parent comment.
+    """
     from selenium.webdriver.common.by import By
     from selenium.common.exceptions import (
         NoSuchElementException,
@@ -453,8 +635,6 @@ def _extract_replies(parent_elem) -> list[dict]:
 
     replies = []
 
-    # Replies are typically nested within the comment's parent container
-    # Try multiple strategies to find reply elements
     try:
         # Strategy 1: Look for nested article elements with "reply" aria-label
         reply_elements = parent_elem.find_elements(
@@ -471,10 +651,23 @@ def _extract_replies(parent_elem) -> list[dict]:
             # Filter: only keep elements that are NOT the parent comment itself
             reply_elements = [r for r in reply_elements if r != parent_elem]
 
+        # Strategy 3: Look for sibling/nested reply containers
+        if not reply_elements and driver:
+            try:
+                # Find all reply articles on the page
+                all_replies = driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "div[role='article'][aria-label*='reply' i]"
+                )
+                reply_elements = all_replies
+            except Exception:
+                pass
+
         for reply_elem in reply_elements:
             try:
                 reply = _parse_comment_element(reply_elem)
                 if reply and reply.get("text"):
+                    # Don't duplicate if text same as parent
                     replies.append(reply)
             except StaleElementReferenceException:
                 continue
@@ -482,7 +675,16 @@ def _extract_replies(parent_elem) -> list[dict]:
     except StaleElementReferenceException:
         pass
 
-    return replies
+    # Deduplicate replies
+    seen = set()
+    unique_replies = []
+    for r in replies:
+        key = (r.get("name", ""), r.get("text", "")[:50])
+        if key not in seen:
+            seen.add(key)
+            unique_replies.append(r)
+
+    return unique_replies
 
 
 def _parse_comment_element(elem) -> dict:
