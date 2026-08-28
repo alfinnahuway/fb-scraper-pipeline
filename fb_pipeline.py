@@ -574,3 +574,205 @@ def _extract_comments_from_dom(driver) -> list[dict]:
             unique.append(c)
     
     return unique
+
+
+def scrape_comments(post_url: str, max_comments: int = 150,
+                    sort_mode: str = "top", expand_replies: bool = True) -> list[dict]:
+    """Scrape comments from a Facebook post using native Selenium."""
+    driver = _init_selenium()
+    
+    from selenium.common.exceptions import TimeoutException
+    
+    log.info(f"  Scraping: {post_url[:70]}...")
+    try:
+        driver.get(post_url)
+    except TimeoutException:
+        log.warning(f"  Page load timeout, skipping")
+        return []
+    
+    time.sleep(8)
+
+    src = driver.page_source
+    src_len = len(src)
+
+    if src_len < 100000:
+        log.warning(f"  Page source too small ({src_len} chars)")
+        return []
+
+    if sort_mode == "recent":
+        _click_sort_recent(driver)
+        time.sleep(3)
+
+    _load_more_comments(driver, max_comments)
+
+    if expand_replies:
+        _expand_replies(driver, max_expansions=50)
+
+    comments = _extract_comments_from_dom(driver)
+
+    total_replies = sum(len(c.get("replies", [])) for c in comments)
+    log.info(f"  Extracted {len(comments)} comments + {total_replies} replies")
+
+    return comments
+
+
+def _close_selenium():
+    """Clean up Selenium driver."""
+    global _driver, _SELENIUM_READY
+    if _driver:
+        _driver.quit()
+        _driver = None
+        _SELENIUM_READY = False
+
+
+def run_pipeline(keyword: str, max_posts: int, max_comments: int,
+                 since: str = None, until: str = None,
+                 output_path: str = None, skip_comments: bool = False,
+                 comment_sort: str = "top", expand_replies: bool = True) -> dict:
+    """Run the full pipeline: search → extract post_id → scrape comments → output JSON."""
+    start_time = time.time()
+    log.info(f"{'='*60}")
+    log.info(f"Pipeline started")
+    log.info(f"  Keyword:        {keyword}")
+    log.info(f"  Max posts:      {max_posts}")
+    log.info(f"  Max comments:   {max_comments}")
+    log.info(f"  Comment sort:   {comment_sort}")
+    log.info(f"  Expand replies: {expand_replies}")
+    log.info(f"{'='*60}")
+
+    log.info(f"\n[Step 1] Searching posts via Apify danek actor...")
+    posts = search_posts(keyword, max_posts, since, until)
+    log.info(f"  Found {len(posts)} posts")
+
+    if not posts:
+        log.warning("No posts found. Exiting.")
+        return {"error": "No posts found", "keyword": keyword}
+
+    for i, p in enumerate(posts):
+        cid = p.get("comments_count", 0)
+        log.info(f"  Post {i+1}: {p['author']} | post_id={p['post_id']} | comments={cid}")
+        log.info(f"    URL: {p['numeric_url'][:80] or p['pfbid_url'][:80]}")
+
+    if not skip_comments:
+        log.info(f"\n[Step 2] Scraping comments via native Selenium (sort={comment_sort})...")
+        total_comments = 0
+        total_replies = 0
+
+        for i, post in enumerate(posts):
+            url = post.get("numeric_url") or post.get("pfbid_url", "")
+            if not url:
+                log.warning(f"  Post {i+1}: No URL available, skipping")
+                continue
+
+            if not post.get("post_id"):
+                log.warning(f"  Post {i+1}: No numeric post_id, URL may not work (pfbid format)")
+
+            if post.get("comments_count", 0) == 0:
+                log.info(f"  Post {i+1}: 0 comments reported, skipping")
+                post["comments"] = []
+                continue
+
+            comments = scrape_comments(
+                url,
+                max_comments=max_comments,
+                sort_mode=comment_sort,
+                expand_replies=expand_replies,
+            )
+            post["comments"] = comments
+            post_comments = len(comments)
+            post_replies = sum(len(c.get("replies", [])) for c in comments)
+            total_comments += post_comments
+            total_replies += post_replies
+            log.info(f"  Post {i+1}: {post_comments} comments + {post_replies} replies (total: {total_comments}c+{total_replies}r)")
+
+            if i < len(posts) - 1:
+                wait_time = 3
+                log.info(f"  Waiting {wait_time}s...")
+                time.sleep(wait_time)
+
+        _close_selenium()
+        log.info(f"\nTotal: {total_comments} comments + {total_replies} replies")
+    else:
+        log.info(f"\n[Step 2] Skipping comment scraping (--skip-comments)")
+        for post in posts:
+            post["comments"] = []
+
+    elapsed = time.time() - start_time
+    result = {
+        "keyword": keyword,
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+        "elapsed_seconds": round(elapsed, 1),
+        "total_posts": len(posts),
+        "total_comments": sum(len(p.get("comments", [])) for p in posts),
+        "total_replies": sum(
+            sum(len(c.get("replies", [])) for c in p.get("comments", []))
+            for p in posts
+        ),
+        "comment_sort": comment_sort if not skip_comments else None,
+        "posts": posts,
+    }
+
+    if not output_path:
+        safe_keyword = re.sub(r"[^\w]+", "_", keyword)
+        output_path = str(OUTPUT_DIR / f"{safe_keyword}_{int(time.time())}.json")
+
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+
+    log.info(f"\n{'='*60}")
+    log.info(f"Pipeline complete!")
+    log.info(f"  Total posts:    {result['total_posts']}")
+    log.info(f"  Total comments: {result['total_comments']}")
+    log.info(f"  Total replies:  {result['total_replies']}")
+    log.info(f"  Elapsed:        {elapsed:.1f}s")
+    log.info(f"  Output:         {output_file}")
+    log.info(f"{'='*60}")
+
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Facebook Scraper Pipeline — keyword search + comment extraction",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python fb_pipeline.py --keyword "DPR RI" --max-posts 5 --max-comments 100
+  python fb_pipeline.py --keyword "Pilpres" --comment-sort recent --max-comments 200
+  python fb_pipeline.py --keyword "INFRASTRUKTUR" --skip-comments
+        """,
+    )
+    parser.add_argument("--keyword", required=True, help="Search keyword")
+    parser.add_argument("--max-posts", type=int, default=DEFAULT_MAX_POSTS, help=f"Max posts to retrieve (default: {DEFAULT_MAX_POSTS})")
+    parser.add_argument("--max-comments", type=int, default=DEFAULT_MAX_COMMENTS, help=f"Max comments per post (default: {DEFAULT_MAX_COMMENTS})")
+    parser.add_argument("--since", default=None, help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--until", default=None, help="End date (YYYY-MM-DD)")
+    parser.add_argument("--output", default=None, help="Output file path")
+    parser.add_argument("--skip-comments", action="store_true", help="Skip comment scraping (posts only)")
+    parser.add_argument("--comment-sort", choices=["top", "recent"], default="top",
+                        help="Comment sort: 'top' (by engagement) or 'recent' (chronological). Default: top")
+    parser.add_argument("--no-replies", action="store_true", help="Skip expanding reply threads")
+    parser.add_argument("--actor", default=SEARCH_ACTOR, help=f"Apify search actor (default: {SEARCH_ACTOR})")
+
+    args = parser.parse_args()
+
+    result = run_pipeline(
+        keyword=args.keyword,
+        max_posts=args.max_posts,
+        max_comments=args.max_comments,
+        since=args.since,
+        until=args.until,
+        output_path=args.output,
+        skip_comments=args.skip_comments,
+        comment_sort=args.comment_sort,
+        expand_replies=not args.no_replies,
+    )
+
+    print(f"\nDone! Output: {args.output or 'auto-generated'}")
+    print(f"Posts: {result.get('total_posts', 0)} | Comments: {result.get('total_comments', 0)} | Replies: {result.get('total_replies', 0)}")
+
+
+if __name__ == "__main__":
+    main()
