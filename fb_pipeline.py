@@ -498,9 +498,15 @@ def _extract_comments_from_dom(driver) -> list[dict]:
         all_articles = driver.find_elements(By.CSS_SELECTOR, "div[role='article']")
         nested_articles = driver.find_elements(By.CSS_SELECTOR, "div[role='article'] div[role='article']")
         
-        # Top-level = all articles minus nested ones
-        nested_set = set(nested_articles)
-        top_level = [a for a in all_articles if a not in nested_set]
+        # Use WebElement IDs for comparison (Selenium assigns unique IDs)
+        nested_ids = set()
+        for n in nested_articles:
+            try:
+                nested_ids.add(n.id)
+            except:
+                pass
+        
+        top_level = [a for a in all_articles if a.id not in nested_ids]
         
         log.info(f"  Articles: {len(all_articles)} total, {len(top_level)} top-level, {len(nested_articles)} nested")
         
