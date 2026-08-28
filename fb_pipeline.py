@@ -177,7 +177,7 @@ def _init_selenium():
         options=chrome_options,
         seleniumwire_options=seleniumwire_options,
     )
-    _driver.set_page_load_timeout(30)
+    _driver.set_page_load_timeout(60)
 
     # Load cookies
     log.info("Loading Facebook cookies...")
@@ -439,32 +439,24 @@ def _extract_comments_from_dom(driver) -> list[dict]:
     # This is MUCH faster than Selenium element-by-element (O(n) vs O(n²))
     js_script = """
     (function() {
-        var result = [];
-        
-        // Find all top-level comment containers
-        var comments = document.querySelectorAll("div[role='article'][aria-label*='comment' i]");
-        
-        for (var i = 0; i < comments.length; i++) {
-            var comment = comments[i];
-            
-            // Extract name: first <a> with role=link or h3 span
+        // Helper: extract structured data from a single comment/reply article element.
+        function parseArticle(el) {
             var name = "";
-            var nameEl = comment.querySelector("a[role='link'] span, a span, h3 span");
+            var nameEl = el.querySelector("a[role='link'] span, a span, h3 span");
             if (nameEl) name = nameEl.textContent.trim();
-            
-            // Extract text: all spans within div[dir=auto]
+
             var text = "";
-            var textEls = comment.querySelectorAll("div[dir='auto'] span, span[dir='auto']");
+            var textEls = el.querySelectorAll("div[dir='auto'] span, span[dir='auto']");
             var texts = [];
             for (var j = 0; j < textEls.length; j++) {
                 var t = textEls[j].textContent.trim();
+                // Avoid duplicating the author name inside the body text
                 if (t && t !== name && t.length > 2) texts.push(t);
             }
             text = texts.join(" ");
-            
-            // Extract likes
+
             var likes = 0;
-            var likeEls = comment.querySelectorAll("[aria-label*='reaction' i] span, span[class*='reaction']");
+            var likeEls = el.querySelectorAll("[aria-label*='reaction' i] span, span[class*='reaction']");
             for (var k = 0; k < likeEls.length; k++) {
                 var lt = likeEls[k].textContent.trim();
                 var nums = lt.match(/[\\d,.]+/);
@@ -473,103 +465,137 @@ def _extract_comments_from_dom(driver) -> list[dict]:
                     break;
                 }
             }
-            
-            // Extract timestamp
+
             var timestamp = "";
-            var timeEl = comment.querySelector("abbr, time, span[class*='timestamp']");
+            var timeEl = el.querySelector("abbr, time, span[class*='timestamp']");
             if (timeEl) {
                 timestamp = timeEl.getAttribute("title") || timeEl.getAttribute("datetime") || timeEl.textContent.trim();
             }
-            
-            // Only add if has text
-            if (text && text.length > 3) {
-                result.push({
-                    name: name,
-                    text: text,
-                    likes_count: likes,
-                    timestamp: timestamp,
-                    comment_id: comment.getAttribute("data-commentid") || comment.id || "",
-                    replies: []
-                });
+
+            return {
+                name: name,
+                text: text,
+                likes_count: likes,
+                timestamp: timestamp,
+                comment_id: el.getAttribute("data-commentid") || el.id || ""
+            };
+        }
+
+        // a) Query ALL div[role='article'] elements on the page.
+        var allArticles = document.querySelectorAll("div[role='article']");
+
+        // b) Classify each as top-level comment or reply based on DOM nesting.
+        //    A reply is an article nested INSIDE another article.
+        //    A top-level comment has no ancestor div[role='article'].
+        var topLevel = [];
+        var replyList = [];
+
+        for (var i = 0; i < allArticles.length; i++) {
+            var art = allArticles[i];
+            // closest() finds the nearest ancestor (not including self) matching the selector.
+            var parentArticle = art.parentElement
+                ? art.parentElement.closest("div[role='article']")
+                : null;
+
+            if (parentArticle) {
+                // d) Reply = has a parent article
+                replyList.push({ el: art, parentArticle: parentArticle });
+            } else {
+                // c) Top-level comment = no parent article
+                topLevel.push({ el: art, index: topLevel.length });
             }
         }
-        
-        // Now find replies: articles with aria-label containing 'reply'
-        var replies = document.querySelectorAll("div[role='article'][aria-label*='reply' i]");
-        var replyData = [];
-        
-        for (var r = 0; r < replies.length; r++) {
-            var reply = replies[r];
-            
-            var rName = "";
-            var rNameEl = reply.querySelector("a[role='link'] span, a span, h3 span");
-            if (rNameEl) rName = rNameEl.textContent.trim();
-            
-            var rText = "";
-            var rTextEls = reply.querySelectorAll("div[dir='auto'] span, span[dir='auto']");
-            var rTexts = [];
-            for (var s = 0; s < rTextEls.length; s++) {
-                var rt = rTextEls[s].textContent.trim();
-                if (rt && rt !== rName && rt.length > 2) rTexts.push(rt);
-            }
-            rText = rTexts.join(" ");
-            
-            var rLikes = 0;
-            var rLikeEls = reply.querySelectorAll("[aria-label*='reaction' i] span, span[class*='reaction']");
-            for (var t = 0; t < rLikeEls.length; t++) {
-                var rlt = rLikeEls[t].textContent.trim();
-                var rnums = rlt.match(/[\\d,.]+/);
-                if (rnums) {
-                    rLikes = parseInt(rnums[0].replace(/[,\\.]/g, ""));
-                    break;
+
+        // Map from DOM element -> top-level comment result index, so we can attach
+        // replies to their nearest preceding top-level comment.
+        // Build a map keyed by the article element itself for O(1) lookup.
+        var topLevelResult = [];
+        var elToTopIndex = {};
+        for (var t = 0; t < topLevel.length; t++) {
+            var parsed = parseArticle(topLevel[t].el);
+            parsed.replies = [];
+            topLevelResult.push(parsed);
+            elToTopIndex[topLevel[t].el] = t;
+        }
+
+        // e) For each reply, find the nearest preceding top-level comment.
+        //    Strategy: walk up + previous siblings to find a top-level comment element.
+        //    If none found via siblings/ancestors, fall back to the immediately
+        //    preceding top-level comment in DOM order.
+        function nearestPrecedingTop(replyEl) {
+            // Walk previous siblings first (closest preceding in DOM order)
+            var sib = replyEl.previousElementSibling;
+            while (sib) {
+                // Is this sibling itself a top-level comment?
+                if (sib.matches && sib.matches("div[role='article']") && elToTopIndex[sib] !== undefined) {
+                    return elToTopIndex[sib];
                 }
+                // Does this sibling contain a top-level comment?
+                var inner = sib.querySelector ? sib.querySelector("div[role='article']") : null;
+                if (inner && elToTopIndex[inner] !== undefined) {
+                    return elToTopIndex[inner];
+                }
+                sib = sib.previousElementSibling;
             }
-            
-            var rTimestamp = "";
-            var rTimeEl = reply.querySelector("abbr, time, span[class*='timestamp']");
-            if (rTimeEl) {
-                rTimestamp = rTimeEl.getAttribute("title") || rTimeEl.getAttribute("datetime") || rTimeEl.textContent.trim();
+            // Walk up ancestors and check their previous siblings
+            var anc = replyEl.parentElement;
+            while (anc && anc !== document.body) {
+                var ancSib = anc.previousElementSibling;
+                while (ancSib) {
+                    if (ancSib.matches && ancSib.matches("div[role='article']") && elToTopIndex[ancSib] !== undefined) {
+                        return elToTopIndex[ancSib];
+                    }
+                    var innerAnc = ancSib.querySelector ? ancSib.querySelector("div[role='article']") : null;
+                    if (innerAnc && elToTopIndex[innerAnc] !== undefined) {
+                        return elToTopIndex[innerAnc];
+                    }
+                    ancSib = ancSib.previousElementSibling;
+                }
+                anc = anc.parentElement;
             }
-            
-            if (rText && rText.length > 3) {
-                replyData.push({
-                    name: rName,
-                    text: rText,
-                    likes_count: rLikes,
-                    timestamp: rTimestamp,
-                    comment_id: reply.getAttribute("data-commentid") || reply.id || "",
-                    parent_text: ""  // Will try to match later
+            return null;
+        }
+
+        for (var r = 0; r < replyList.length; r++) {
+            var parsedReply = parseArticle(replyList[r].el);
+            if (!parsedReply.text || parsedReply.text.length <= 3) continue;
+
+            var matchIdx = nearestPrecedingTop(replyList[r].el);
+            if (matchIdx === null) {
+                // Fallback: attach to the last top-level comment before this reply
+                // in document order, if any exists.
+                // Find the index of the last top-level comment that appears before
+                // this reply in DOM order.
+                var bestIdx = -1;
+                for (var ti = 0; ti < topLevel.length; ti++) {
+                    if (topLevel[ti].el.compareDocumentPosition(replyList[r].el) & Node.DOCUMENT_POSITION_FOLLOWING) {
+                        bestIdx = ti;
+                    } else {
+                        break;
+                    }
+                }
+                if (bestIdx >= 0) matchIdx = bestIdx;
+            }
+
+            if (matchIdx !== null && matchIdx >= 0) {
+                topLevelResult[matchIdx].replies.push({
+                    name: parsedReply.name,
+                    text: parsedReply.text,
+                    likes_count: parsedReply.likes_count,
+                    timestamp: parsedReply.timestamp,
+                    comment_id: parsedReply.comment_id
                 });
             }
         }
-        
-        // Match replies to parent comments by proximity
-        // For now, attach replies to the most recent comment before them
-        for (var p = 0; p < replyData.length; p++) {
-            // Find nearest preceding comment
-            var replyEl = document.querySelectorAll("div[role='article'][aria-label*='reply' i]")[p];
-            var bestMatch = null;
-            var bestDist = Infinity;
-            
-            // Check all comments
-            for (var q = 0; q < result.length; q++) {
-                // If reply text contains part of comment text, it's likely a match
-                // Otherwise, just attach to last comment (fallback)
-                bestMatch = q;
-            }
-            
-            if (bestMatch !== null) {
-                result[bestMatch].replies.push({
-                    name: replyData[p].name,
-                    text: replyData[p].text,
-                    likes_count: replyData[p].likes_count,
-                    timestamp: replyData[p].timestamp,
-                    comment_id: replyData[p].comment_id
-                });
+
+        // Only keep top-level comments that have meaningful text
+        var finalResult = [];
+        for (var f = 0; f < topLevelResult.length; f++) {
+            if (topLevelResult[f].text && topLevelResult[f].text.length > 3) {
+                finalResult.push(topLevelResult[f]);
             }
         }
-        
-        return result;
+        return finalResult;
     })();
     """
     
@@ -793,8 +819,14 @@ def scrape_comments(post_url: str, max_comments: int = 150,
     """
     driver = _init_selenium()
 
+    from selenium.common.exceptions import TimeoutException
+
     log.info(f"  Scraping: {post_url[:70]}...")
-    driver.get(post_url)
+    try:
+        driver.get(post_url)
+    except TimeoutException:
+        log.warning(f"  Timeout loading post: {post_url[:70]}... — skipping")
+        return []
     time.sleep(8)
 
     src = driver.page_source
