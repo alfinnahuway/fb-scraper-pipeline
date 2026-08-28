@@ -1,5 +1,5 @@
 .env
 fb_cookies.txt
-output/
+# output/
 __pycache__/
 *.pyc
