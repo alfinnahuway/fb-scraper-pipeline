@@ -439,7 +439,6 @@ def _extract_comments_from_dom(driver) -> list[dict]:
     # This is MUCH faster than Selenium element-by-element (O(n) vs O(n²))
     js_script = """
     (function() {
-        // Helper: extract structured data from a single comment/reply article element.
         function parseArticle(el) {
             var name = "";
             var nameEl = el.querySelector("a[role='link'] span, a span, h3 span");
@@ -450,7 +449,6 @@ def _extract_comments_from_dom(driver) -> list[dict]:
             var texts = [];
             for (var j = 0; j < textEls.length; j++) {
                 var t = textEls[j].textContent.trim();
-                // Avoid duplicating the author name inside the body text
                 if (t && t !== name && t.length > 2) texts.push(t);
             }
             text = texts.join(" ");
@@ -481,95 +479,74 @@ def _extract_comments_from_dom(driver) -> list[dict]:
             };
         }
 
-        // a) Query ALL div[role='article'] elements on the page.
         var allArticles = document.querySelectorAll("div[role='article']");
 
-        // b) Classify each as top-level comment or reply based on DOM nesting.
-        //    A reply is an article nested INSIDE another article.
-        //    A top-level comment has no ancestor div[role='article'].
+        // Classify: top-level comment vs reply
+        // Method 1: Check if aria-label starts with "Reply" (most reliable)
+        // Method 2: Check if element is nested inside another article (depth > 0)
         var topLevel = [];
         var replyList = [];
 
         for (var i = 0; i < allArticles.length; i++) {
             var art = allArticles[i];
-            // closest() finds the nearest ancestor (not including self) matching the selector.
-            var parentArticle = art.parentElement
-                ? art.parentElement.closest("div[role='article']")
-                : null;
+            var aria = (art.getAttribute('aria-label') || '').toLowerCase();
 
-            if (parentArticle) {
-                // d) Reply = has a parent article
-                replyList.push({ el: art, parentArticle: parentArticle });
+            // Check nesting: walk up parent chain
+            var depth = 0;
+            var p = art.parentElement;
+            while (p) {
+                if (p.getAttribute && p.getAttribute('role') === 'article') depth++;
+                p = p.parentElement;
+            }
+
+            // A reply if: aria starts with "reply" OR depth > 0
+            var isReply = (aria.indexOf('reply') === 0) || depth > 0;
+
+            if (isReply) {
+                replyList.push({ el: art, depth: depth, aria: aria });
             } else {
-                // c) Top-level comment = no parent article
-                topLevel.push({ el: art, index: topLevel.length });
+                topLevel.push({ el: art, idx: topLevel.length });
             }
         }
 
-        // Map from DOM element -> top-level comment result index, so we can attach
-        // replies to their nearest preceding top-level comment.
-        // Build a map keyed by the article element itself for O(1) lookup.
+        // Parse top-level comments
         var topLevelResult = [];
-        var elToTopIndex = {};
         for (var t = 0; t < topLevel.length; t++) {
             var parsed = parseArticle(topLevel[t].el);
             parsed.replies = [];
             topLevelResult.push(parsed);
-            elToTopIndex[topLevel[t].el] = t;
         }
 
-        // e) For each reply, find the nearest preceding top-level comment.
-        //    Strategy: walk up + previous siblings to find a top-level comment element.
-        //    If none found via siblings/ancestors, fall back to the immediately
-        //    preceding top-level comment in DOM order.
-        function nearestPrecedingTop(replyEl) {
-            // Walk previous siblings first (closest preceding in DOM order)
-            var sib = replyEl.previousElementSibling;
-            while (sib) {
-                // Is this sibling itself a top-level comment?
-                if (sib.matches && sib.matches("div[role='article']") && elToTopIndex[sib] !== undefined) {
-                    return elToTopIndex[sib];
-                }
-                // Does this sibling contain a top-level comment?
-                var inner = sib.querySelector ? sib.querySelector("div[role='article']") : null;
-                if (inner && elToTopIndex[inner] !== undefined) {
-                    return elToTopIndex[inner];
-                }
-                sib = sib.previousElementSibling;
-            }
-            // Walk up ancestors and check their previous siblings
-            var anc = replyEl.parentElement;
-            while (anc && anc !== document.body) {
-                var ancSib = anc.previousElementSibling;
-                while (ancSib) {
-                    if (ancSib.matches && ancSib.matches("div[role='article']") && elToTopIndex[ancSib] !== undefined) {
-                        return elToTopIndex[ancSib];
-                    }
-                    var innerAnc = ancSib.querySelector ? ancSib.querySelector("div[role='article']") : null;
-                    if (innerAnc && elToTopIndex[innerAnc] !== undefined) {
-                        return elToTopIndex[innerAnc];
-                    }
-                    ancSib = ancSib.previousElementSibling;
-                }
-                anc = anc.parentElement;
-            }
-            return null;
-        }
-
+        // For each reply, find nearest preceding top-level comment
+        // Use aria-label pattern: "Reply by X to Y's comment" -> find comment by Y
         for (var r = 0; r < replyList.length; r++) {
             var parsedReply = parseArticle(replyList[r].el);
             if (!parsedReply.text || parsedReply.text.length <= 3) continue;
 
-            var matchIdx = nearestPrecedingTop(replyList[r].el);
-            if (matchIdx === null) {
-                // Fallback: attach to the last top-level comment before this reply
-                // in document order, if any exists.
-                // Find the index of the last top-level comment that appears before
-                // this reply in DOM order.
+            // Try to match via aria-label: "Reply by [Name] to [Parent]'s comment"
+            var ariaText = replyList[r].aria;
+            var matchIdx = -1;
+
+            // Extract parent name from "reply by x to y's comment"
+            var parentMatch = ariaText.match(/to\\s+(.+?)[']?s\\s*comment/);
+            if (parentMatch) {
+                var parentName = parentMatch[1].trim().toLowerCase();
+                // Find top-level comment with matching name
+                for (var ti = topLevelResult.length - 1; ti >= 0; ti--) {
+                    if (topLevelResult[ti].name && topLevelResult[ti].name.toLowerCase().indexOf(parentName) >= 0) {
+                        matchIdx = ti;
+                        break;
+                    }
+                }
+            }
+
+            // Fallback: find nearest preceding top-level by DOM order
+            if (matchIdx < 0) {
+                var replyEl = replyList[r].el;
                 var bestIdx = -1;
-                for (var ti = 0; ti < topLevel.length; ti++) {
-                    if (topLevel[ti].el.compareDocumentPosition(replyList[r].el) & Node.DOCUMENT_POSITION_FOLLOWING) {
-                        bestIdx = ti;
+                for (var ti2 = 0; ti2 < topLevel.length; ti2++) {
+                    if (topLevel[ti2].el.compareDocumentPosition(replyEl) & Node.DOCUMENT_POSITION_FOLLOWING) {
+                        bestIdx = ti2;
                     } else {
                         break;
                     }
@@ -577,7 +554,12 @@ def _extract_comments_from_dom(driver) -> list[dict]:
                 if (bestIdx >= 0) matchIdx = bestIdx;
             }
 
-            if (matchIdx !== null && matchIdx >= 0) {
+            // Last resort: attach to previous top-level
+            if (matchIdx < 0 && topLevelResult.length > 0) {
+                matchIdx = topLevelResult.length - 1;
+            }
+
+            if (matchIdx >= 0) {
                 topLevelResult[matchIdx].replies.push({
                     name: parsedReply.name,
                     text: parsedReply.text,
@@ -588,7 +570,7 @@ def _extract_comments_from_dom(driver) -> list[dict]:
             }
         }
 
-        // Only keep top-level comments that have meaningful text
+        // Only keep top-level comments with text
         var finalResult = [];
         for (var f = 0; f < topLevelResult.length; f++) {
             if (topLevelResult[f].text && topLevelResult[f].text.length > 3) {
